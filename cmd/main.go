@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/klog/v2"
 	k8sget "k8s.io/kubectl/pkg/cmd/get"
 )
 
@@ -32,6 +33,7 @@ type args struct {
 	clusterLabelSelector string
 	includeAll           bool
 	version              bool
+	summary              bool
 }
 
 const (
@@ -42,6 +44,7 @@ func main() {
 	defaultLogger := stderrLogger{
 		stderr: os.Stderr,
 	}
+
 	rootCmd, err := parseCliArgs()
 	if err != nil {
 		defaultLogger.Failuref("%v", err)
@@ -74,6 +77,7 @@ func parseCliArgs() (*cobra.Command, error) {
 	rootCmd.Flags().BoolVarP(&flags.includeAll, "include-all", "a", flags.includeAll, "Includes resources which are considered as dynamic resources")
 	rootCmd.Flags().StringVarP(&flags.clusterLabelSelector, "cluster-selector", "l", flags.clusterLabelSelector, "Label selector for checked resources (is used for all apis)")
 	rootCmd.Flags().StringVarP(&flags.gitopsLabelSelector, "gitops-selector", "", flags.gitopsLabelSelector, "Label selector for gitops helm releases and kustomizations")
+	rootCmd.Flags().BoolVarP(&flags.summary, "summary", "s", flags.summary, "Print summary")
 
 	rootCmd.DisableAutoGenTag = true
 	rootCmd.SetOut(os.Stdout)
@@ -120,6 +124,10 @@ func run(gitopsKubeConfig, clusterKubeConfig clientcmd.ClientConfig, logger stde
 		return nil
 	}
 
+	if !flags.verbose {
+		klog.LogToStderr(false)
+	}
+
 	// default processing
 	gitopsClient, err := getSimpleClient(gitopsKubeConfig)
 	if err != nil {
@@ -136,37 +144,47 @@ func run(gitopsKubeConfig, clusterKubeConfig clientcmd.ClientConfig, logger stde
 		return err
 	}
 
-	gitopsNamespace, isSet, err := gitopsKubeConfig.Namespace()
-	if err != nil {
-		return err
-	}
-	if gitopsNamespace == "default" && !isSet {
-		gitopsNamespace = ""
-	}
-
-	clusterNamespace, isSet, err := clusterKubeConfig.Namespace()
-	if err != nil {
-		return err
-	}
-	if clusterNamespace == "default" && !isSet {
-		clusterNamespace = ""
-	}
-
-	zombies, err := detectZombies(logger, flags, gitopsClient, clusterSimpleClient, clusterDiscoveryClient, gitopsNamespace, clusterNamespace)
+	gitopsNamespace, err := getNamespaceFromConfig(gitopsKubeConfig)
 	if err != nil {
 		return err
 	}
 
-	return printZombies(zombies, printFlags)
+	clusterNamespace, err := getNamespaceFromConfig(clusterKubeConfig)
+	if err != nil {
+		return err
+	}
+
+	resourceCount, zombies, err := detectZombies(logger, flags, gitopsClient, clusterSimpleClient, clusterDiscoveryClient, gitopsNamespace, clusterNamespace)
+	if err != nil {
+		return err
+	}
+
+	err = printZombies(zombies, printFlags)
+	if err != nil {
+		return err
+	}
+
+	if flags.summary {
+		fmt.Printf("\nSummary: %d resources found, %d zombies detected\n", resourceCount, len(zombies))
+	}
+
+	if len(zombies) > 0 {
+		return fmt.Errorf("%d zombies will eat you", len(zombies))
+	}
+
+	return nil
 }
 
-func detectZombies(logger stderrLogger, flags args, gitopsClient, clusterSimpleClient dynamic.Interface, clusterDiscoveryClient *discovery.DiscoveryClient, gitopsNamespace, clusterNamespace string) ([]unstructured.Unstructured, error) {
-	var zombies []unstructured.Unstructured
+func detectZombies(logger stderrLogger, flags args, gitopsClient, clusterSimpleClient dynamic.Interface, clusterDiscoveryClient *discovery.DiscoveryClient, gitopsNamespace, clusterNamespace string) (int, []unstructured.Unstructured, error) {
+	var (
+		zombies       []unstructured.Unstructured
+		resourceCount int
+	)
 
 	logger.Debugf("⎈ Helm releases ⎈")
 	helmReleases, err := getHelmReleases(gitopsClient, gitopsNamespace, flags)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get helmreleases: %w", err)
+		return 0, nil, fmt.Errorf("failed to get helmreleases: %w", err)
 	}
 	for _, h := range helmReleases {
 		logger.Debugf(h.GetName())
@@ -175,7 +193,7 @@ func detectZombies(logger stderrLogger, flags args, gitopsClient, clusterSimpleC
 	logger.Debugf("👷 Kustomizations 👷")
 	kustomizations, err := getKustomizations(gitopsClient, gitopsNamespace, flags)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get helmreleases: %w", err)
+		return 0, nil, fmt.Errorf("failed to get helmreleases: %w", err)
 	}
 	for _, k := range kustomizations {
 		logger.Debugf(k.GetName())
@@ -184,7 +202,7 @@ func detectZombies(logger stderrLogger, flags args, gitopsClient, clusterSimpleC
 	logger.Debugf("👨‍👩‍👧‍👧 Groups 👨‍👩‍👧‍👧")
 	list, err := listServerGroupsAndResources(clusterDiscoveryClient)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list groups and resources: %w", err)
+		return 0, nil, fmt.Errorf("failed to list groups and resources: %w", err)
 	}
 	for _, g := range list {
 		logger.Debugf(g.GroupVersion)
@@ -193,8 +211,7 @@ func detectZombies(logger stderrLogger, flags args, gitopsClient, clusterSimpleC
 	ch := make(chan unstructured.Unstructured)
 	var wgProducer, wgConsumer sync.WaitGroup
 
-	discover := collector.NewDiscovery(
-		logger,
+	discover := collector.NewDiscovery(logger,
 		collector.IgnoreOwnedResource(),
 		collector.IgnoreServiceAccountSecret(),
 		collector.IgnoreHelmSecret(),
@@ -208,7 +225,7 @@ func detectZombies(logger stderrLogger, flags args, gitopsClient, clusterSimpleC
 
 		gv, err := schema.ParseGroupVersion(group.GroupVersion)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 
 		for _, resource := range group.APIResources {
@@ -225,9 +242,11 @@ func detectZombies(logger stderrLogger, flags args, gitopsClient, clusterSimpleC
 			go func() {
 				defer wgProducer.Done()
 
-				if err := handleResource(context.TODO(), discover, resAPI, ch, flags); err != nil {
+				count, err := handleResource(context.TODO(), discover, resAPI, ch, flags)
+				if err != nil {
 					logger.Failuref("could not handle resource: %s", err)
 				}
+				resourceCount += count
 			}()
 		}
 	}
@@ -244,7 +263,19 @@ func detectZombies(logger stderrLogger, flags args, gitopsClient, clusterSimpleC
 	close(ch)
 	wgConsumer.Wait()
 
-	return zombies, nil
+	return resourceCount, zombies, nil
+}
+
+func getNamespaceFromConfig(conf clientcmd.ClientConfig) (string, error) {
+	namespace, isSet, err := conf.Namespace()
+	if err != nil {
+		return "", err
+	}
+	if namespace == "default" && !isSet {
+		namespace = ""
+	}
+
+	return namespace, nil
 }
 
 func getSimpleClient(kubeconfig clientcmd.ClientConfig) (dynamic.Interface, error) {
@@ -386,15 +417,15 @@ func validateResource(gv schema.GroupVersion, resource metav1.APIResource, flags
 	return &gvr, nil
 }
 
-func handleResource(ctx context.Context, discover collector.Interface, resAPI dynamic.ResourceInterface, ch chan unstructured.Unstructured, flags args) error {
+func handleResource(ctx context.Context, discover collector.Interface, resAPI dynamic.ResourceInterface, ch chan unstructured.Unstructured, flags args) (int, error) {
 	list, err := resAPI.List(ctx, metav1.ListOptions{
 		LabelSelector: getResourceLabelSelector(flags),
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	return discover.Discover(ctx, list, ch)
+	return len(list.Items), discover.Discover(ctx, list, ch)
 }
 
 func printZombies(zombies []unstructured.Unstructured, printFlags *k8sget.PrintFlags) error {
